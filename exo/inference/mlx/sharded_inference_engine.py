@@ -13,6 +13,10 @@ import asyncio
 from collections import OrderedDict
 from mlx_lm.models.cache import make_prompt_cache
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+# OKHand.zy add library
+import os
+from pathlib import Path
 
 class MLXDynamicShardInferenceEngine(InferenceEngine):
   def __init__(self, shard_downloader: ShardDownloader):
@@ -165,6 +169,9 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
   async def ensure_shard(self, shard: Shard):
     async with self._shard_lock:
       if self.shard == shard: return
+          if os.path.isdir(shard.model_id): # if local model
+      model_path = Path(shard.model_id)
+    else:
       model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
       if self.shard != shard:
         model_shard = await asyncio.get_running_loop().run_in_executor(

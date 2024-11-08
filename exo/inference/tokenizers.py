@@ -49,6 +49,12 @@ async def resolve_tokenizer(repo_id: Union[str, PathLike]):
 
   # Original Hugging Face handling
   local_path = await ensure_downloads_dir()/str(repo_id).replace("/", "--")
+  
+  local_path = await get_local_snapshot_dir(model_id)
+  if not local_path: # local model path
+    local_path = model_id.rstrip('/')
+    model_id = 'local/'+str(local_path.split('/')[-1])
+
   if DEBUG >= 2: print(f"Checking if local path exists to load tokenizer from local {local_path=}")
   try:
     if local_path and await aios.path.exists(local_path):

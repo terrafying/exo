@@ -29,6 +29,9 @@ from exo.inference.inference_engine import get_inference_engine
 from exo.inference.tokenizers import resolve_tokenizer
 from exo.models import build_base_shard, get_repo, load_additional_models
 from exo.viz.topology_viz import TopologyViz
+# OKHand.zy add library
+import os 
+import json
 import uvloop
 import concurrent.futures
 import resource
@@ -216,15 +219,25 @@ node.on_opaque_status.register("update_prompt_viz").on_next(update_prompt_viz)
 def preemptively_load_shard(request_id: str, opaque_status: str):
   try:
     status = json.loads(opaque_status)
-    if status.get("type") != "node_status" or status.get("status") != "start_process_prompt": return
-    current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
-    if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
-    asyncio.create_task(node.inference_engine.ensure_shard(current_shard))
+    if status.get("type") == "node_status" and status.get("status") == "start_process_prompt":
+      current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
+      if os.path.isdir(current_shard.model_id):
+        # TODO: open ftp to share download model 
+        pass
+      else:
+        if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
+        asyncio.create_task(shard_downloader.ensure_shard(current_shard))
+    
   except Exception as e:
     if DEBUG >= 2:
       print(f"Failed to preemptively start download: {e}")
       traceback.print_exc()
-node.on_opaque_status.register("preemptively_load_shard").on_next(preemptively_load_shard)
+
+node.on_opaque_status.register("start_download").on_next(preemptively_start_download)
+
+if args.prometheus_client_port:
+  from exo.stats.metrics import start_metrics_server
+  start_metrics_server(node, args.prometheus_client_port)
 
 last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
 def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
@@ -238,13 +251,42 @@ def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
   asyncio.create_task(node.broadcast_opaque_status("", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
 shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
 
-async def run_model_cli(node: Node, model_name: str, prompt: str):
-  inference_class = node.inference_engine.__class__.__name__
-  shard = build_base_shard(model_name, inference_class)
-  if not shard:
-    print(f"Error: Unsupported model '{model_name}' for inference engine {inference_class}")
+
+async def shutdown(signal, loop):
+  """Gracefully shutdown the server and close the asyncio loop."""
+  print(f"Received exit signal {signal.name}...")
+  print("Thank you for using exo.")
+  print_yellow_exo()
+  server_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+  [task.cancel() for task in server_tasks]
+  print(f"Cancelling {len(server_tasks)} outstanding tasks")
+  await asyncio.gather(*server_tasks, return_exceptions=True)
+  await server.stop()
+  loop.stop()
+
+
+async def run_model_cli(node: Node, inference_engine: InferenceEngine, model_name: str, prompt: str):
+  if model_base_shards.get(model_name) :
+    shard = model_base_shards.get(model_name, {}).get(inference_engine.__class__.__name__)
+    if not shard:
+      print(f"Error: Unsupported model '{model_name}' for inference engine {inference_engine.__class__.__name__}")
+      return
+    tokenizer = await resolve_tokenizer(shard.model_id)
+  elif os.path.isdir(model_name):
+    # local model   
+    # local model shard
+    model_path = model_name.rstrip('/')
+    model_name = model_path.split('/')[-1]
+    if os.path.isfile(model_path+'/config.json'):
+      with open(model_path+'/config.json', 'r') as file:
+        config = json.load(file)
+        config_n_layers = config['num_hidden_layers']
+      shard = Shard(model_id=model_path, start_layer=0, end_layer=0, n_layers=config_n_layers)
+      tokenizer = await resolve_tokenizer(model_path)
+  else:
+    print(f"Error: Unsupported model '{model_name}' for inference engine {inference_engine.__class__.__name__}")
     return
-  tokenizer = await resolve_tokenizer(get_repo(shard.model_id, inference_class))
+  
   request_id = str(uuid.uuid4())
   callback_id = f"cli-wait-response-{request_id}"
   callback = node.on_token.register(callback_id)
