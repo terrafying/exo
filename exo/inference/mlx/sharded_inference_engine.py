@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.sample_utils import make_sampler
 import mlx.optimizers as optim
 from ..inference_engine import InferenceEngine
-from .sharded_utils import load_model_shard, resolve_tokenizer
+from .sharded_utils import load_model_shard, resolve_tokenizer, load_shard
 from .losses import loss_fns
 from ..shard import Shard
 from typing import Dict, Optional, Tuple
@@ -27,6 +27,7 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     self.sampler = make_sampler(*self.sampler_params)
     self._mlx_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
     self._tokenizer_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tokenizer")
+    self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard")
     self.session = {}
     self._shard_lock = asyncio.Lock()
 
@@ -89,6 +90,10 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     await self.ensure_shard(shard)
     state = await self.poll_state(request_id) if self.model.model_type != 'StableDiffusionPipeline' else {}
     x = mx.array(input_data)
+    if len(x.shape) == 1:
+      x = x.reshape(1, -1)
+    elif len(x.shape) == 2:
+      x = x.reshape(x.shape[0], x.shape[1])
 
     if self.model.model_type != 'StableDiffusionPipeline':
       output_data = await asyncio.get_running_loop().run_in_executor(
@@ -170,14 +175,12 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     if self.shard == shard:
       return
 
-    model_path = await self.shard_downloader.ensure_shard(shard)
+    model_path = await self.shard_downloader.ensure_shard(shard, "MLXDynamicShardInferenceEngine")
 
     if self.shard != shard:
       loop = asyncio.get_running_loop()
-
       def load_shard_wrapper():
-        return asyncio.run(load_shard(model_path, shard))
+        return load_shard(model_path, shard)
 
-      model_shard, self.tokenizer = await loop.run_in_executor(self.executor, load_shard_wrapper)
-      self.stateful_sharded_model = await loop.run_in_executor(self.executor, StatefulShardedModel, shard, model_shard)
+      self.model, self.tokenizer = await loop.run_in_executor(self.executor, lambda: asyncio.run(load_shard_wrapper()))
       self.shard = shard

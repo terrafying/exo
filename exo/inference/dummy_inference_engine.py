@@ -15,19 +15,39 @@ class DummyInferenceEngine(InferenceEngine):
     self.num_generate_dummy_tokens = 10
     self.tokenizer = DummyTokenizer()
 
-  async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
-    return np.array(self.tokenizer.encode(prompt))
-  
-  async def sample(self, x: np.ndarray, temp: float = 0.0, top_p: float = 1.0) -> np.ndarray:
-    if x[0] > self.num_generate_dummy_tokens: return np.array([self.tokenizer.eos_token_id])
-    return x
-
-  async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
-    return self.tokenizer.decode(tokens)
-
-  async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray, inference_state: Optional[dict] = None) -> tuple[np.ndarray, Optional[dict]]:
+  async def encode(self, request_id: str, shard: Shard, prompt: str) -> np.ndarray:
+    """Encode a prompt into tokens"""
     await self.ensure_shard(shard)
-    return input_data + 1 if self.shard.is_last_layer() else input_data, None
+    tokens = [ord(c) for c in prompt]
+    return np.array(tokens).reshape(1, -1)  # Ensure 2D output
+
+  async def sample(self, request_id: str, shard: Shard, logits: np.ndarray) -> np.ndarray:
+    """Sample from logits"""
+    await self.ensure_shard(shard)
+    if logits.shape[-1] == 0:
+      return np.array([[0]])  # Return EOS token if no logits
+    return np.array([[np.argmax(logits[-1])]]).reshape(1, -1)  # Ensure 2D output
+
+  async def decode(self, request_id: str, shard: Shard, tokens: np.ndarray) -> str:
+    """Decode tokens into text"""
+    await self.ensure_shard(shard)
+    if tokens.ndim == 2:
+      tokens = tokens.flatten()  # Flatten if 2D
+    return ''.join(chr(int(t)) for t in tokens)
+
+  async def infer_tensor(self, request_id: str, shard: Shard, data: np.ndarray, inference_state: Optional[dict] = None) -> tuple[np.ndarray, Optional[dict]]:
+    """Infer tensor through the model"""
+    await self.ensure_shard(shard)
+    
+    # Ensure input is 2D
+    if data.ndim == 1:
+      data = data.reshape(1, -1)
+      
+    # Add 1 to each element if this is the last layer
+    if self.shard.is_last_layer():
+      data = data + 1
+      
+    return data, inference_state or {}
 
   async def ensure_shard(self, shard: Shard):
     if self.shard == shard: return

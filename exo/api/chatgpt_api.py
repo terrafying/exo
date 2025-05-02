@@ -252,149 +252,200 @@ class ChatGPTAPI:
     return web.json_response(progress_data)
 
   async def handle_post_chat_completions(self, request):
-    data = await request.json()
-    if DEBUG >= 2: print(f"[ChatGPTAPI] Handling chat completions request from {request.remote}: {data}")
-    stream = data.get("stream", False)
-    chat_request = ChatCompletionRequest.from_chat_request_dict(data, self.default_model)
-    if chat_request.model and chat_request.model.startswith(
-      "gpt-"):  # to be compatible with ChatGPT tools, point all gpt- model requests to default model
-      chat_request.model = self.default_model
-    if not chat_request.model or chat_request.model not in model_cards:
-      if DEBUG >= 1: print(
-        f"[ChatGPTAPI] Invalid model: {chat_request.model}. Supported: {list(model_cards.keys())}. Defaulting to {self.default_model}")
-      chat_request.model = self.default_model
-    shard = build_base_shard(chat_request.model, self.inference_engine_classname)
-    if not shard:
-      supported_models = [model for model, info in model_cards.items() if
-                          self.inference_engine_classname in info.get("repo", {})]
-      return web.json_response(
-        {
-          "detail": f"Unsupported model: {chat_request.model} with inference engine {self.inference_engine_classname}. Supported models for this engine: {supported_models}"},
-        status=400,
-      )
-
-    model_card = get_model_card(chat_request.model)
-    tokenizer = await resolve_tokenizer(get_repo(shard.model_id, self.inference_engine_classname))
-    if DEBUG >= 4: print(f"[ChatGPTAPI] Resolved tokenizer: {tokenizer}")
-
-    # Add system prompt if set
-    if self.system_prompt and not any(msg.role == "system" for msg in chat_request.messages):
-      chat_request.messages.insert(0, Message("system", self.system_prompt))
-
-    if model_card and model_card.chat_template:
-      tokenizer.chat_template = model_card.chat_template
-
-    prompt = build_prompt(tokenizer, chat_request.messages, [tool.model_dump() for tool in chat_request.get_tools()])
-    request_id = str(uuid.uuid4())
-
-    # Register tokenizer and model with the result manager
-    self.result_manager.register_tokenizer(request_id, tokenizer)
-    self.result_manager.register_model_for_request(request_id, chat_request.model)
-
-    if self.on_chat_completion_request:
-      try:
-        self.on_chat_completion_request(request_id, chat_request, prompt)
-      except Exception as e:
-        if DEBUG >= 2: traceback.print_exc()
-
-    if DEBUG >= 2: print(f"[ChatGPTAPI] Processing prompt: {request_id=} {shard=} {prompt=}")
-
     try:
-      await asyncio.wait_for(asyncio.shield(asyncio.create_task(self.node.process_prompt(
-        shard,
-        prompt,
-        request_id=request_id,
-        generation_options=chat_request.to_generation_options()
-      ))), timeout=self.response_timeout)
+      data = await request.json()
+      if DEBUG >= 2: print(f"[ChatGPTAPI] Handling chat completions request from {request.remote}: {data}")
+      
+      stream = data.get("stream", False)
+      chat_request = ChatCompletionRequest.from_chat_request_dict(data, self.default_model)
+      
+      # Model validation
+      if chat_request.model and chat_request.model.startswith("gpt-"):
+        chat_request.model = self.default_model
+      if not chat_request.model or chat_request.model not in model_cards:
+        if DEBUG >= 1: print(f"[ChatGPTAPI] Invalid model: {chat_request.model}. Supported: {list(model_cards.keys())}. Defaulting to {self.default_model}")
+        chat_request.model = self.default_model
+      
+      # Build shard and validate
+      shard = build_base_shard(chat_request.model, self.inference_engine_classname)
+      if not shard:
+        supported_models = [model for model, info in model_cards.items() if self.inference_engine_classname in info.get("repo", {})]
+        return web.json_response({
+          "error": {
+            "message": f"Unsupported model: {chat_request.model} with inference engine {self.inference_engine_classname}. Supported models for this engine: {supported_models}",
+            "type": "invalid_request_error",
+            "code": "invalid_model"
+          }
+        }, status=400)
 
-      if DEBUG >= 2:
-        print(f"[ChatGPTAPI] Waiting for response to finish. timeout={self.response_timeout}s")
-        print(f"[ChatGPTAPI] Tool consideration {chat_request.tool_behaviour=} {chat_request.get_tool_parser()=} {chat_request.enable_tool_parsing()=}")
+      # Get model card and tokenizer
+      model_card = get_model_card(chat_request.model)
+      tokenizer = await resolve_tokenizer(get_repo(shard.model_id, self.inference_engine_classname))
+      if DEBUG >= 4: print(f"[ChatGPTAPI] Resolved tokenizer: {tokenizer}")
 
-      if stream:
+      # Add system prompt if set
+      if self.system_prompt and not any(msg.role == "system" for msg in chat_request.messages):
+        chat_request.messages.insert(0, Message("system", self.system_prompt))
+
+      if model_card and model_card.chat_template:
+        tokenizer.chat_template = model_card.chat_template
+
+      # Build prompt
+      prompt = build_prompt(tokenizer, chat_request.messages, [tool.model_dump() for tool in chat_request.get_tools()])
+      request_id = str(uuid.uuid4())
+
+      # Register with result manager
+      self.result_manager.register_tokenizer(request_id, tokenizer)
+      self.result_manager.register_model_for_request(request_id, chat_request.model)
+
+      if self.on_chat_completion_request:
         try:
-          response = web.StreamResponse(
-            status=200,
-            reason="OK",
-            headers={
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-            },
-          )
-          await response.prepare(request)
-
-          async for completion in self.handle_chat_completions_streaming(request_id, chat_request, tokenizer, prompt):
-            await response.write(f"data: {json.dumps(completion)}\n\n".encode())
-
-          await response.write(b"data: [DONE]\n\n")
-          await response.write_eof()
-          return response
-        # TODO: How should this appear in the SSE stream? I don't think this is right
-        except asyncio.TimeoutError:
-          if DEBUG >= 2: print(f"[ChatGPTAPI] Timeout waiting for token: {request_id=}")
-          return web.json_response({"detail": "Response generation timed out"}, status=408)
+          self.on_chat_completion_request(request_id, chat_request, prompt)
         except Exception as e:
           if DEBUG >= 2: traceback.print_exc()
-          return web.json_response({"detail": f"Error processing request: {str(e)}"}, status=500)
 
+      if DEBUG >= 2: print(f"[ChatGPTAPI] Processing prompt: {request_id=} {shard=} {prompt=}")
 
-      else:
-        # Non-streaming mode: get complete result
-        tool_parser = chat_request.get_tool_parser()
-        if DEBUG >= 2: print("Using tool_parser:", tool_parser)
-        result = await self.result_manager.get_complete_inference_result(request_id, timeout=self.response_timeout)
-
-        print("GOT RESULT: ", result)
-        # TODO: This is a hack to get around the lack of information we get out of the tool parser as to its state
-        #       This provides the following simplifying assumptions:
-        #       - The message will either contain a tool call begining at the first token, or it will not contain any tool calls.
-        #       - A tool call can be identified from the initial emitted chunk.
-        #       - We do not stream tool calls, they are emitted in a single completion object.
-        if chat_request.enable_tool_parsing() and tool_parser and tool_parser.is_start_of_tool_section(result):
-          tool_calls = [{
-            "index": i,
-            "function": tool_call.model_dump(),
-            "id": f"tool_call_{str(uuid.uuid4())}",
-            "type": "function",
-          } for i, tool_call in enumerate(tool_parser.parse_complete(result.text, chat_request.parallel_tool_calling))]
-
-          completion = {
-            "id": f"chatcmpl-{request_id}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": chat_request.model,
-            "system_fingerprint": f"exo_{VERSION}",
-            "choices": [{
-              "index": 0,
-              "logprobs": None,
-              "finish_reason": 'tool_calls',
-              "message": {
-                "tool_calls": tool_calls,
-              }
-            }],
-          }
-
-          return web.json_response(completion)
-
-        return web.json_response(
-          ChatCompletionRequest.generate_completion(
-            chat_request,
-            tokenizer,
-            prompt,
-            request_id,
-            result.tokens,
-            result.text,
-            False,
-            result.finish_reason,
-            "chat.completion"
-          )
+      # Process prompt with timeout
+      try:
+        await asyncio.wait_for(
+          asyncio.shield(
+            asyncio.create_task(
+              self.node.process_prompt(
+                shard,
+                prompt,
+                request_id=request_id,
+                generation_options=chat_request.to_generation_options()
+              )
+            )
+          ),
+          timeout=self.response_timeout
         )
 
-    except asyncio.TimeoutError:
-      return web.json_response({"detail": "Response generation timed out"}, status=408)
+        if stream:
+          return await self._handle_streaming_response(request, request_id, chat_request, tokenizer, prompt)
+        else:
+          return await self._handle_non_streaming_response(request_id, chat_request, tokenizer, prompt)
+
+      except asyncio.TimeoutError:
+        return web.json_response({
+          "error": {
+            "message": "Response generation timed out",
+            "type": "timeout_error",
+            "code": "timeout"
+          }
+        }, status=408)
+      except Exception as e:
+        if DEBUG >= 2: traceback.print_exc()
+        return web.json_response({
+          "error": {
+            "message": f"Error processing request: {str(e)}",
+            "type": "internal_error",
+            "code": "internal_error"
+          }
+        }, status=500)
+
+    except json.JSONDecodeError:
+      return web.json_response({
+        "error": {
+          "message": "Invalid JSON in request body",
+          "type": "invalid_request_error",
+          "code": "invalid_json"
+        }
+      }, status=400)
     except Exception as e:
       if DEBUG >= 2: traceback.print_exc()
-      return web.json_response({"detail": f"Error processing request: {str(e)}"}, status=500)
+      return web.json_response({
+        "error": {
+          "message": f"Unexpected error: {str(e)}",
+          "type": "internal_error",
+          "code": "internal_error"
+        }
+      }, status=500)
+
+  async def _handle_streaming_response(self, request, request_id, chat_request, tokenizer, prompt):
+    try:
+      response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        },
+      )
+      await response.prepare(request)
+
+      async for completion in self.handle_chat_completions_streaming(request_id, chat_request, tokenizer, prompt):
+        await response.write(f"data: {json.dumps(completion)}\n\n".encode())
+
+      await response.write(b"data: [DONE]\n\n")
+      await response.write_eof()
+      return response
+    except Exception as e:
+      if DEBUG >= 2: traceback.print_exc()
+      return web.json_response({
+        "error": {
+          "message": f"Error in streaming response: {str(e)}",
+          "type": "internal_error",
+          "code": "streaming_error"
+        }
+      }, status=500)
+
+  async def _handle_non_streaming_response(self, request_id, chat_request, tokenizer, prompt):
+    try:
+      tool_parser = chat_request.get_tool_parser()
+      if DEBUG >= 2: print("Using tool_parser:", tool_parser)
+      
+      result = await self.result_manager.get_complete_inference_result(request_id, timeout=self.response_timeout)
+      
+      if chat_request.enable_tool_parsing() and tool_parser and tool_parser.is_start_of_tool_section(result):
+        tool_calls = [{
+          "index": i,
+          "function": tool_call.model_dump(),
+          "id": f"tool_call_{str(uuid.uuid4())}",
+          "type": "function",
+        } for i, tool_call in enumerate(tool_parser.parse_complete(result.text, chat_request.parallel_tool_calling))]
+
+        completion = {
+          "id": f"chatcmpl-{request_id}",
+          "object": "chat.completion",
+          "created": int(time.time()),
+          "model": chat_request.model,
+          "system_fingerprint": f"exo_{VERSION}",
+          "choices": [{
+            "index": 0,
+            "logprobs": None,
+            "finish_reason": 'tool_calls',
+            "message": {
+              "tool_calls": tool_calls,
+            }
+          }],
+        }
+
+        return web.json_response(completion)
+
+      return web.json_response(
+        ChatCompletionRequest.generate_completion(
+          chat_request,
+          tokenizer,
+          prompt,
+          request_id,
+          result.tokens,
+          result.text,
+          False,
+          result.finish_reason,
+          "chat.completion"
+        )
+      )
+    except Exception as e:
+      if DEBUG >= 2: traceback.print_exc()
+      return web.json_response({
+        "error": {
+          "message": f"Error in non-streaming response: {str(e)}",
+          "type": "internal_error",
+          "code": "response_error"
+        }
+      }, status=500)
 
   async def handle_chat_completions_streaming(self, request_id: str, chat_request: ChatCompletionRequest, tokenizer, prompt: str):
     tool_parser = chat_request.get_tool_parser()
@@ -687,3 +738,41 @@ class ChatGPTAPI:
     img = (img[:, :, :3].astype(mx.float32) / 255) * 2 - 1
     img = img[None]
     return img
+
+  async def _format_completion_response(self, completion: str, request_id: str) -> Dict:
+    """Format completion response to match OpenAI API format"""
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": self.default_model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": completion
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 0,  # TODO: Implement token counting
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }
+
+  async def _format_stream_response(self, chunk: str, request_id: str, is_final: bool = False) -> Dict:
+    """Format streaming response to match OpenAI API format"""
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": self.default_model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": chunk
+            },
+            "finish_reason": "stop" if is_final else None
+        }]
+    }
