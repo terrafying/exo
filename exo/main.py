@@ -23,9 +23,9 @@ from exo.api import ChatGPTAPI
 from exo.download.shard_download import ShardDownloader, NoopShardDownloader
 from exo.download.download_progress import RepoProgressEvent
 from exo.download.new_shard_download import new_shard_downloader, has_exo_home_read_access, has_exo_home_write_access, ensure_exo_home, seed_models
-from exo.helpers import print_yellow_exo, find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown, get_device_capabilities_json
+from exo.helpers import print_yellow_exo, find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, get_device_capabilities_json
 from exo.inference.shard import Shard
-from exo.inference.inference_engine import get_inference_engine
+from exo.inference.inference_engine import get_inference_engine, InferenceEngine
 from exo.inference.tokenizers import resolve_tokenizer
 from exo.models import build_base_shard, get_repo, load_additional_models
 from exo.viz.topology_viz import TopologyViz
@@ -97,6 +97,7 @@ parser.add_argument("--node-id-filter", type=str, default=None, help="Comma sepa
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default=None, help="System prompt for the ChatGPT API")
 parser.add_argument("--additional-models", type=str, default=None, help="A JSON file of additional models to serve")
+parser.add_argument("--prometheus-client-port", type=int, default=None, help="Port for Prometheus metrics server")
 args = parser.parse_args()
 
 # Handle the --get-device-capabilities option before printing anything else so it can be used for automation
@@ -174,85 +175,146 @@ if args.additional_models is not None:
 
   load_additional_models(path)
 
-node = Node(
-  args.node_id,
-  None,
-  inference_engine,
-  discovery,
-  shard_downloader,
-  partitioning_strategy=RingMemoryWeightedPartitioningStrategy(),
-  max_generate_tokens=args.max_generate_tokens,
-  topology_viz=topology_viz,
-  default_sample_temperature=args.default_temp
-)
-server = GRPCServer(node, args.node_host, args.node_port)
-node.server = server
-api = ChatGPTAPI(
-  node,
-  node.inference_engine.__class__.__name__,
-  response_timeout=args.chatgpt_api_response_timeout,
-  on_chat_completion_request=lambda req_id, __, prompt: topology_viz.update_prompt(req_id, prompt) if topology_viz else None,
-  default_model=args.default_model,
-  system_prompt=args.system_prompt
-)
-buffered_token_output = {}
-def update_topology_viz(req_id, tokens, __, ___):
-  if not topology_viz: return
-  if not node.inference_engine.shard: return
-  if node.inference_engine.shard.model_id == 'stable-diffusion-2-1-base': return
-  if req_id in buffered_token_output: buffered_token_output[req_id].extend(tokens)
-  else: buffered_token_output[req_id] = tokens
-  topology_viz.update_prompt_output(req_id, node.inference_engine.tokenizer.decode(buffered_token_output[req_id]))
-node.on_token.register("update_topology_viz").on_next(update_topology_viz)
-def update_prompt_viz(request_id, opaque_status: str):
-  if not topology_viz: return
-  try:
-    status = json.loads(opaque_status)
-    if status.get("type") != "node_status" or status.get("status") != "start_process_prompt": return
-    topology_viz.update_prompt(request_id, status.get("prompt", "corrupted prompt (this should never happen)"))
-  except Exception as e:
-    if DEBUG >= 2:
-      print(f"Failed to update prompt viz: {e}")
-      traceback.print_exc()
-node.on_opaque_status.register("update_prompt_viz").on_next(update_prompt_viz)
+async def main():
+  loop = asyncio.get_running_loop()
 
-def preemptively_load_shard(request_id: str, opaque_status: str):
-  try:
-    status = json.loads(opaque_status)
-    if status.get("type") == "node_status" and status.get("status") == "start_process_prompt":
-      current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
-      if os.path.isdir(current_shard.model_id):
-        # TODO: open ftp to share download model 
-        pass
-      else:
-        if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
-        asyncio.create_task(shard_downloader.ensure_shard(current_shard))
+  try: await check_exo_home()
+  except Exception as e: print(f"Error checking exo home directory: {e}")
+
+  if not args.models_seed_dir is None:
+    try:
+      models_seed_dir = clean_path(args.models_seed_dir)
+      await seed_models(models_seed_dir)
+    except Exception as e:
+      print(f"Error seeding models: {e}")
+
+  def restore_cursor():
+    if platform.system() != "Windows":
+        os.system("tput cnorm")  # Show cursor
+
+  # Restore the cursor when the program exits
+  atexit.register(restore_cursor)
+
+  # Create node and server before setting up signal handlers
+  node = Node(
+    args.node_id,
+    None,
+    inference_engine,
+    discovery,
+    shard_downloader,
+    partitioning_strategy=RingMemoryWeightedPartitioningStrategy(),
+    max_generate_tokens=args.max_generate_tokens,
+    topology_viz=topology_viz,
+    default_sample_temperature=args.default_temp
+  )
+  server = GRPCServer(node, args.node_host, args.node_port)
+  node.server = server
+
+  # Use a more direct approach to handle signals
+  def handle_exit():
+    asyncio.ensure_future(shutdown(signal.SIGTERM, loop, server))
+
+  if platform.system() != "Windows":
+    for s in [signal.SIGINT, signal.SIGTERM]:
+      loop.add_signal_handler(s, handle_exit)
+
+  await node.start(wait_for_peers=args.wait_for_peers)
+
+  api = ChatGPTAPI(
+    node,
+    node.inference_engine.__class__.__name__,
+    response_timeout=args.chatgpt_api_response_timeout,
+    on_chat_completion_request=lambda req_id, __, prompt: topology_viz.update_prompt(req_id, prompt) if topology_viz else None,
+    default_model=args.default_model,
+    system_prompt=args.system_prompt
+  )
+  buffered_token_output = {}
+  def update_topology_viz(req_id, tokens, __, ___):
+    if not topology_viz: return
+    if not node.inference_engine.shard: return
+    if node.inference_engine.shard.model_id == 'stable-diffusion-2-1-base': return
+    if req_id in buffered_token_output: buffered_token_output[req_id].extend(tokens)
+    else: buffered_token_output[req_id] = tokens
+    topology_viz.update_prompt_output(req_id, node.inference_engine.tokenizer.decode(buffered_token_output[req_id]))
+  node.on_token.register("update_topology_viz").on_next(update_topology_viz)
+  def update_prompt_viz(request_id, opaque_status: str):
+    if not topology_viz: return
+    try:
+      status = json.loads(opaque_status)
+      if status.get("type") != "node_status" or status.get("status") != "start_process_prompt": return
+      topology_viz.update_prompt(request_id, status.get("prompt", "corrupted prompt (this should never happen)"))
+    except Exception as e:
+      if DEBUG >= 2:
+        print(f"Failed to update prompt viz: {e}")
+        traceback.print_exc()
+  node.on_opaque_status.register("update_prompt_viz").on_next(update_prompt_viz)
+
+  def preemptively_load_shard(request_id: str, opaque_status: str):
+    try:
+      status = json.loads(opaque_status)
+      if status.get("type") == "node_status" and status.get("status") == "start_process_prompt":
+        current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
+        if os.path.isdir(current_shard.model_id):
+          # TODO: open ftp to share download model 
+          pass
+        else:
+          if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
+          asyncio.create_task(shard_downloader.ensure_shard(current_shard))
     
-  except Exception as e:
-    if DEBUG >= 2:
-      print(f"Failed to preemptively start download: {e}")
-      traceback.print_exc()
+    except Exception as e:
+      if DEBUG >= 2:
+        print(f"Failed to preemptively start download: {e}")
+        traceback.print_exc()
 
-node.on_opaque_status.register("start_download").on_next(preemptively_start_download)
+  node.on_opaque_status.register("start_download").on_next(preemptively_load_shard)
 
-if args.prometheus_client_port:
-  from exo.stats.metrics import start_metrics_server
-  start_metrics_server(node, args.prometheus_client_port)
+  if args.prometheus_client_port:
+    from exo.stats.metrics import start_metrics_server
+    start_metrics_server(node, args.prometheus_client_port)
 
-last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
-def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
-  global last_events
-  current_time = time.time()
-  if event.status == "not_started": return
-  last_event = last_events.get(shard.model_id)
-  if last_event and last_event[1].status == "complete" and event.status == "complete": return
-  if last_event and last_event[0] == event.status and current_time - last_event[0] < 0.2: return
-  last_events[shard.model_id] = (current_time, event)
-  asyncio.create_task(node.broadcast_opaque_status("", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
-shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
+  last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
+  def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
+    global last_events
+    current_time = time.time()
+    if event.status == "not_started": return
+    last_event = last_events.get(shard.model_id)
+    if last_event and last_event[1].status == "complete" and event.status == "complete": return
+    if last_event and last_event[0] == event.status and current_time - last_event[0] < 0.2: return
+    last_events[shard.model_id] = (current_time, event)
+    asyncio.create_task(node.broadcast_opaque_status("", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
+  shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
 
+  if args.command == "run" or args.run_model:
+    model_name = args.model_name or args.run_model
+    if not model_name:
+      print("Error: Model name is required when using 'run' command or --run-model")
+      return
+    await run_model_cli(node, inference_engine, model_name, args.prompt)
+  elif args.command == "eval" or args.command == 'train':
+    model_name = args.model_name
+    dataloader = lambda tok: load_dataset(args.data, preprocess=lambda item: tok(item)
+                                                   , loadline=lambda line: json.loads(line).get("text",""))
+    if args.command == 'eval':
+      if not model_name:
+        print("Error: Much like a human, I can't evaluate anything without a model")
+        return
+      await eval_model_cli(node, model_name, dataloader, args.batch_size)
+    else:
+      if not model_name:
+        print("Error: This train ain't leaving the station without a model")
+        return
+      await train_model_cli(node, model_name, dataloader, args.batch_size, args.iters, save_interval=args.save_every, checkpoint_dir=args.save_checkpoint_dir)
 
-async def shutdown(signal, loop):
+  else:
+    asyncio.create_task(api.run(port=args.chatgpt_api_port))  # Start the API server as a non-blocking task
+    await asyncio.Event().wait()
+
+  if args.wait_for_peers > 0:
+    print("Cooldown to allow peers to exit gracefully")
+    for i in tqdm(range(50)):
+      await asyncio.sleep(.1)
+
+async def shutdown(signal, loop, server=None):
   """Gracefully shutdown the server and close the asyncio loop."""
   print(f"Received exit signal {signal.name}...")
   print("Thank you for using exo.")
@@ -261,9 +323,9 @@ async def shutdown(signal, loop):
   [task.cancel() for task in server_tasks]
   print(f"Cancelling {len(server_tasks)} outstanding tasks")
   await asyncio.gather(*server_tasks, return_exceptions=True)
-  await server.stop()
+  if server:
+    await server.stop()
   loop.stop()
-
 
 async def run_model_cli(node: Node, inference_engine: InferenceEngine, model_name: str, prompt: str):
   if model_base_shards.get(model_name) :
@@ -380,66 +442,6 @@ async def check_exo_home():
           {"❌ No write access" if not has_write else ""}
           """)
 
-async def main():
-  loop = asyncio.get_running_loop()
-
-  try: await check_exo_home()
-  except Exception as e: print(f"Error checking exo home directory: {e}")
-
-  if not args.models_seed_dir is None:
-    try:
-      models_seed_dir = clean_path(args.models_seed_dir)
-      await seed_models(models_seed_dir)
-    except Exception as e:
-      print(f"Error seeding models: {e}")
-
-  def restore_cursor():
-    if platform.system() != "Windows":
-        os.system("tput cnorm")  # Show cursor
-
-  # Restore the cursor when the program exits
-  atexit.register(restore_cursor)
-
-  # Use a more direct approach to handle signals
-  def handle_exit():
-    asyncio.ensure_future(shutdown(signal.SIGTERM, loop, node.server))
-
-  if platform.system() != "Windows":
-    for s in [signal.SIGINT, signal.SIGTERM]:
-      loop.add_signal_handler(s, handle_exit)
-
-  await node.start(wait_for_peers=args.wait_for_peers)
-
-  if args.command == "run" or args.run_model:
-    model_name = args.model_name or args.run_model
-    if not model_name:
-      print("Error: Model name is required when using 'run' command or --run-model")
-      return
-    await run_model_cli(node, model_name, args.prompt)
-  elif args.command == "eval" or args.command == 'train':
-    model_name = args.model_name
-    dataloader = lambda tok: load_dataset(args.data, preprocess=lambda item: tok(item)
-                                                   , loadline=lambda line: json.loads(line).get("text",""))
-    if args.command == 'eval':
-      if not model_name:
-        print("Error: Much like a human, I can't evaluate anything without a model")
-        return
-      await eval_model_cli(node, model_name, dataloader, args.batch_size)
-    else:
-      if not model_name:
-        print("Error: This train ain't leaving the station without a model")
-        return
-      await train_model_cli(node, model_name, dataloader, args.batch_size, args.iters, save_interval=args.save_every, checkpoint_dir=args.save_checkpoint_dir)
-
-  else:
-    asyncio.create_task(api.run(port=args.chatgpt_api_port))  # Start the API server as a non-blocking task
-    await asyncio.Event().wait()
-
-  if args.wait_for_peers > 0:
-    print("Cooldown to allow peers to exit gracefully")
-    for i in tqdm(range(50)):
-      await asyncio.sleep(.1)
-
 def run():
     loop = None
     try:
@@ -447,8 +449,21 @@ def run():
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\nShutdown requested... exiting")
+    except asyncio.CancelledError:
+        print("\nShutdown complete")
     finally:
-        if loop: loop.close()
+        if loop:
+            try:
+                # Cancel all running tasks
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                # Wait for all tasks to complete with a timeout
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                # Close the loop
+                loop.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-  run()
+    run()
