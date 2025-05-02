@@ -1,0 +1,32 @@
+From 880682a71e5b4860dfcad03e98c86b041ea45f5e Mon Sep 17 00:00:00 2001
+From: "OKHand.ziyu" <OKHand.ziyu@gmail.com>
+Date: Fri, 6 Dec 2024 11:40:11 +0800
+Subject: [PATCH 13/26] filter: other dir no config error
+
+---
+ exo/main.py | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/exo/main.py b/exo/main.py
+index 29b163b..48bc40a 100644
+--- a/exo/main.py
++++ b/exo/main.py
+@@ -82,10 +82,11 @@ for folder_path in Path(exo_path).iterdir():
+     model_path = folder_path
+     model_name = folder_path.name
+     config_file_path = Path(folder_path/'config.json')
+-    with open(config_file_path, 'r') as file:
+-      config = json.load(file)
+-      config_n_layers = config['num_hidden_layers']
+-    build_local_model_card(model_name, model_path, inference_engine.__class__.__name__, int(config_n_layers))
++    if config_file_path.is_file():
++      with open(config_file_path, 'r') as file:
++        config = json.load(file)
++        config_n_layers = config['num_hidden_layers']
++        build_local_model_card(model_name, model_path, inference_engine.__class__.__name__, int(config_n_layers))
+ print(f"Init local model card complete")
+ 
+ if args.node_port is None:
+-- 
+2.39.5 (Apple Git-154)
+

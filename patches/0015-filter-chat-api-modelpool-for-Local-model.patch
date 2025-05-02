@@ -1,0 +1,75 @@
+From cb270ed0e6272b1630a97945c7d9c7aad774ff23 Mon Sep 17 00:00:00 2001
+From: "OKHand.ziyu" <OKHand.ziyu@gmail.com>
+Date: Thu, 12 Dec 2024 11:52:27 +0800
+Subject: [PATCH 15/26] filter: chat-api modelpool for Local model
+
+---
+ exo/api/chatgpt_api.py                        | 21 ++++++++++++-------
+ exo/inference/mlx/sharded_inference_engine.py |  4 ++--
+ exo/main.py                                   |  2 +-
+ 3 files changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/exo/api/chatgpt_api.py b/exo/api/chatgpt_api.py
+index 8f07c59..b05a787 100644
+--- a/exo/api/chatgpt_api.py
++++ b/exo/api/chatgpt_api.py
+@@ -241,14 +241,19 @@ class ChatGPTAPI:
+                 if self.inference_engine_classname in model_info.get("repo", {}):
+                     shard = build_base_shard(model_name, self.inference_engine_classname)
+                     if shard:
+-                        downloader = HFShardDownloader(quick_check=True)
+-                        downloader.current_shard = shard
+-                        downloader.current_repo_id = get_repo(shard.model_id, self.inference_engine_classname)
+-                        status = await downloader.get_shard_download_status()
+-
+-                        download_percentage = status.get("overall") if status else None
+-                        total_size = status.get("total_size") if status else None
+-                        total_downloaded = status.get("total_downloaded") if status else False
++                        if 'Local/' in model_name:
++                          download_percentage = 100.0
++                          total_size = "Unknown"
++                          total_downloaded = "Unknown"
++                        else:
++                          downloader = HFShardDownloader(quick_check=True)
++                          downloader.current_shard = shard
++                          downloader.current_repo_id = get_repo(shard.model_id, self.inference_engine_classname)
++                          status = await downloader.get_shard_download_status()
++
++                          download_percentage = status.get("overall") if status else None
++                          total_size = status.get("total_size") if status else None
++                          total_downloaded = status.get("total_downloaded") if status else False
+ 
+                         model_data = {
+                             model_name: {
+diff --git a/exo/inference/mlx/sharded_inference_engine.py b/exo/inference/mlx/sharded_inference_engine.py
+index 8a4bb63..e81023a 100644
+--- a/exo/inference/mlx/sharded_inference_engine.py
++++ b/exo/inference/mlx/sharded_inference_engine.py
+@@ -140,9 +140,9 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
+     if self.shard == shard:
+       return
+ 
+-    if os.path.isdir(shard.model_id): # cli mode
++    if os.path.isdir(shard.model_id): # path mode
+       model_path = Path(shard.model_id) 
+-    elif "Local" in shard.model_id: # api mode
++    elif "Local" in shard.model_id: # Local card mode
+       model_path = Path(get_repo(shard.model_id, self.__class__.__name__))
+     else:
+       model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
+diff --git a/exo/main.py b/exo/main.py
+index 3113b0e..30fb1d3 100644
+--- a/exo/main.py
++++ b/exo/main.py
+@@ -100,7 +100,7 @@ for folder_path in Path(exo_path).iterdir():
+         config = json.load(file)
+         config_n_layers = config['num_hidden_layers']
+         build_local_model_card(model_name, model_path, inference_engine.__class__.__name__, int(config_n_layers))
+-print(f"Init local model card complete")
++print(f"Add Local Model Complete!!")
+ 
+ if args.node_port is None:
+   args.node_port = find_available_port(args.node_host) 
+-- 
+2.39.5 (Apple Git-154)
+

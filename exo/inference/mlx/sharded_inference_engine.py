@@ -167,25 +167,17 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     return score, first_layer
 
   async def ensure_shard(self, shard: Shard):
-    async with self._shard_lock:
-      if self.shard == shard: return
-          if os.path.isdir(shard.model_id): # if local model
-      model_path = Path(shard.model_id)
-    else:
-      model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
-      if self.shard != shard:
-        model_shard = await asyncio.get_running_loop().run_in_executor(
-          self._mlx_thread,
-          lambda: load_model_shard(model_path, shard, lazy=False)
-        )
-        if hasattr(model_shard, "tokenizer"):
-          self.tokenizer = model_shard.tokenizer
-        else:
-          self.tokenizer = await resolve_tokenizer(model_path)
-        self.shard = shard
-        self.model = model_shard
-        self.caches = OrderedDict()
-        self.session = {}
+    if self.shard == shard:
+      return
 
-  async def cleanup(self):
-    self._mlx_thread.shutdown(wait=True)
+    model_path = await self.shard_downloader.ensure_shard(shard)
+
+    if self.shard != shard:
+      loop = asyncio.get_running_loop()
+
+      def load_shard_wrapper():
+        return asyncio.run(load_shard(model_path, shard))
+
+      model_shard, self.tokenizer = await loop.run_in_executor(self.executor, load_shard_wrapper)
+      self.stateful_sharded_model = await loop.run_in_executor(self.executor, StatefulShardedModel, shard, model_shard)
+      self.shard = shard

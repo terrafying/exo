@@ -1,0 +1,34 @@
+From 0b87eb9fbce386c1107280338484b07886760e06 Mon Sep 17 00:00:00 2001
+From: "OKHand.ziyu" <OKHand.ziyu@gmail.com>
+Date: Fri, 15 Nov 2024 10:41:30 +0800
+Subject: [PATCH 02/26] filter merge erro
+
+---
+ exo/main.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/exo/main.py b/exo/main.py
+index 4b17872..1eea728 100644
+--- a/exo/main.py
++++ b/exo/main.py
+@@ -23,7 +23,7 @@ from exo.inference.inference_engine import get_inference_engine, InferenceEngine
+ from exo.inference.dummy_inference_engine import DummyInferenceEngine
+ from exo.inference.tokenizers import resolve_tokenizer
+ from exo.orchestration.node import Node
+-from exo.models import build_base_shard, get_repo
++from exo.models import model_cards, build_base_shard, get_repo
+ from exo.viz.topology_viz import TopologyViz
+ # OKHand.zy add library
+ import os 
+@@ -182,7 +182,7 @@ async def shutdown(signal, loop):
+ 
+ 
+ async def run_model_cli(node: Node, inference_engine: InferenceEngine, model_name: str, prompt: str):
+-  if model_base_shards.get(model_name) :
++  if model_cards.get(model_name):
+     inference_class = inference_engine.__class__.__name__
+     shard = build_base_shard(model_name, inference_class)
+     if not shard:
+-- 
+2.39.5 (Apple Git-154)
+
