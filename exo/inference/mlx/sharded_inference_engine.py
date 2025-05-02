@@ -13,6 +13,10 @@ import asyncio
 from collections import OrderedDict
 from mlx_lm.models.cache import make_prompt_cache
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+# OKHand.zy add library
+import os
+from pathlib import Path
 
 class MLXDynamicShardInferenceEngine(InferenceEngine):
   def __init__(self, shard_downloader: ShardDownloader):
@@ -39,12 +43,17 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
       self.caches[request_id] = newcache
     return {"cache": self.caches[request_id]}
 
-  async def sample(self, x: np.ndarray, temp: float = 0.0, top_p: float = 1.0) -> np.ndarray:
+  async def sample(self, x: np.ndarray, temp: float = 0.0, top_p: float = 1.0, mask: Optional[np.ndarray] = None) -> np.ndarray:
     if (temp, top_p, 0.0, 1) != self.sampler_params:
       self.sampler_params = (temp, top_p, 0.0, 1)
       self.sampler = make_sampler(*self.sampler_params)
     logits = mx.array(x)
     logits = logits[:, -1, :]
+
+    if mask is not None:
+      # Why doesn't apply_token_bitmask work here?
+      logits = mx.where(mask == 0, float('-inf'), logits)
+
     logprobs = logits - mx.logsumexp(logits, keepdims=True)
     result = self.sampler(logprobs)
     await self._eval_mlx(result)
@@ -158,22 +167,17 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     return score, first_layer
 
   async def ensure_shard(self, shard: Shard):
-    async with self._shard_lock:
-      if self.shard == shard: return
-      model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
-      if self.shard != shard:
-        model_shard = await asyncio.get_running_loop().run_in_executor(
-          self._mlx_thread,
-          lambda: load_model_shard(model_path, shard, lazy=False)
-        )
-        if hasattr(model_shard, "tokenizer"):
-          self.tokenizer = model_shard.tokenizer
-        else:
-          self.tokenizer = await resolve_tokenizer(model_path)
-        self.shard = shard
-        self.model = model_shard
-        self.caches = OrderedDict()
-        self.session = {}
+    if self.shard == shard:
+      return
 
-  async def cleanup(self):
-    self._mlx_thread.shutdown(wait=True)
+    model_path = await self.shard_downloader.ensure_shard(shard)
+
+    if self.shard != shard:
+      loop = asyncio.get_running_loop()
+
+      def load_shard_wrapper():
+        return asyncio.run(load_shard(model_path, shard))
+
+      model_shard, self.tokenizer = await loop.run_in_executor(self.executor, load_shard_wrapper)
+      self.stateful_sharded_model = await loop.run_in_executor(self.executor, StatefulShardedModel, shard, model_shard)
+      self.shard = shard

@@ -8,6 +8,7 @@ import os
 import time
 import traceback
 import uuid
+from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 from exo.train.dataset import load_dataset, iterate_batches
@@ -22,12 +23,15 @@ from exo.api import ChatGPTAPI
 from exo.download.shard_download import ShardDownloader, NoopShardDownloader
 from exo.download.download_progress import RepoProgressEvent
 from exo.download.new_shard_download import new_shard_downloader, has_exo_home_read_access, has_exo_home_write_access, ensure_exo_home, seed_models
-from exo.helpers import print_yellow_exo, find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown
+from exo.helpers import print_yellow_exo, find_available_port, DEBUG, get_system_info, get_or_create_node_id, get_all_ip_addresses_and_interfaces, terminal_link, shutdown, get_device_capabilities_json
 from exo.inference.shard import Shard
 from exo.inference.inference_engine import get_inference_engine
 from exo.inference.tokenizers import resolve_tokenizer
-from exo.models import build_base_shard, get_repo
+from exo.models import build_base_shard, get_repo, load_additional_models
 from exo.viz.topology_viz import TopologyViz
+# OKHand.zy add library
+import os 
+import json
 import uvloop
 import concurrent.futures
 import resource
@@ -77,6 +81,7 @@ parser.add_argument("--broadcast-port", type=int, default=5678, help="Broadcast 
 parser.add_argument("--discovery-module", type=str, choices=["udp", "tailscale", "manual"], default="udp", help="Discovery module to use")
 parser.add_argument("--discovery-timeout", type=int, default=30, help="Discovery timeout in seconds")
 parser.add_argument("--discovery-config-path", type=str, default=None, help="Path to discovery config json file")
+parser.add_argument("--get-device-capabilities", action="store_true", help="Output the current device's auto-detected capabilities in JSON format and exit")
 parser.add_argument("--wait-for-peers", type=int, default=0, help="Number of peers to wait to connect to before starting")
 parser.add_argument("--chatgpt-api-port", type=int, default=52415, help="ChatGPT API port")
 parser.add_argument("--chatgpt-api-response-timeout", type=int, default=900, help="ChatGPT API response timeout in seconds")
@@ -91,7 +96,14 @@ parser.add_argument("--tailnet-name", type=str, default=None, help="Tailnet name
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default=None, help="System prompt for the ChatGPT API")
+parser.add_argument("--additional-models", type=str, default=None, help="A JSON file of additional models to serve")
 args = parser.parse_args()
+
+# Handle the --get-device-capabilities option before printing anything else so it can be used for automation
+if args.get_device_capabilities:
+    print(get_device_capabilities_json())
+    exit(0)
+
 print(f"Selected inference engine: {args.inference_engine}")
 
 print_yellow_exo()
@@ -149,8 +161,19 @@ elif args.discovery_module == "tailscale":
 elif args.discovery_module == "manual":
   if not args.discovery_config_path:
     raise ValueError(f"--discovery-config-path is required when using manual discovery. Please provide a path to a config json file.")
+  # Manual discovery uses a JSON config file that defines all nodes in the network
+  # The config file should contain a "peers" object mapping node_ids to their connection details
+  # See NetworkTopology class in exo/networking/manual/network_topology_config.py for the expected format
   discovery = ManualDiscovery(args.discovery_config_path, args.node_id, create_peer_handle=lambda peer_id, address, description, device_capabilities: GRPCPeerHandle(peer_id, address, description, device_capabilities))
 topology_viz = TopologyViz(chatgpt_api_endpoints=chatgpt_api_endpoints, web_chat_urls=web_chat_urls) if not args.disable_tui else None
+
+if args.additional_models is not None:
+  path = Path(args.additional_models)
+  if not path.exists():
+    raise ValueError(f"Additional models file {path} does not exist")
+
+  load_additional_models(path)
+
 node = Node(
   args.node_id,
   None,
@@ -173,7 +196,7 @@ api = ChatGPTAPI(
   system_prompt=args.system_prompt
 )
 buffered_token_output = {}
-def update_topology_viz(req_id, tokens, __):
+def update_topology_viz(req_id, tokens, __, ___):
   if not topology_viz: return
   if not node.inference_engine.shard: return
   if node.inference_engine.shard.model_id == 'stable-diffusion-2-1-base': return
@@ -196,15 +219,25 @@ node.on_opaque_status.register("update_prompt_viz").on_next(update_prompt_viz)
 def preemptively_load_shard(request_id: str, opaque_status: str):
   try:
     status = json.loads(opaque_status)
-    if status.get("type") != "node_status" or status.get("status") != "start_process_prompt": return
-    current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
-    if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
-    asyncio.create_task(node.inference_engine.ensure_shard(current_shard))
+    if status.get("type") == "node_status" and status.get("status") == "start_process_prompt":
+      current_shard = node.get_current_shard(Shard.from_dict(status.get("shard")))
+      if os.path.isdir(current_shard.model_id):
+        # TODO: open ftp to share download model 
+        pass
+      else:
+        if DEBUG >= 2: print(f"Preemptively starting download for {current_shard}")
+        asyncio.create_task(shard_downloader.ensure_shard(current_shard))
+    
   except Exception as e:
     if DEBUG >= 2:
       print(f"Failed to preemptively start download: {e}")
       traceback.print_exc()
-node.on_opaque_status.register("preemptively_load_shard").on_next(preemptively_load_shard)
+
+node.on_opaque_status.register("start_download").on_next(preemptively_start_download)
+
+if args.prometheus_client_port:
+  from exo.stats.metrics import start_metrics_server
+  start_metrics_server(node, args.prometheus_client_port)
 
 last_events: dict[str, tuple[float, RepoProgressEvent]] = {}
 def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
@@ -218,13 +251,42 @@ def throttled_broadcast(shard: Shard, event: RepoProgressEvent):
   asyncio.create_task(node.broadcast_opaque_status("", json.dumps({"type": "download_progress", "node_id": node.id, "progress": event.to_dict()})))
 shard_downloader.on_progress.register("broadcast").on_next(throttled_broadcast)
 
-async def run_model_cli(node: Node, model_name: str, prompt: str):
-  inference_class = node.inference_engine.__class__.__name__
-  shard = build_base_shard(model_name, inference_class)
-  if not shard:
-    print(f"Error: Unsupported model '{model_name}' for inference engine {inference_class}")
+
+async def shutdown(signal, loop):
+  """Gracefully shutdown the server and close the asyncio loop."""
+  print(f"Received exit signal {signal.name}...")
+  print("Thank you for using exo.")
+  print_yellow_exo()
+  server_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+  [task.cancel() for task in server_tasks]
+  print(f"Cancelling {len(server_tasks)} outstanding tasks")
+  await asyncio.gather(*server_tasks, return_exceptions=True)
+  await server.stop()
+  loop.stop()
+
+
+async def run_model_cli(node: Node, inference_engine: InferenceEngine, model_name: str, prompt: str):
+  if model_base_shards.get(model_name) :
+    shard = model_base_shards.get(model_name, {}).get(inference_engine.__class__.__name__)
+    if not shard:
+      print(f"Error: Unsupported model '{model_name}' for inference engine {inference_engine.__class__.__name__}")
+      return
+    tokenizer = await resolve_tokenizer(shard.model_id)
+  elif os.path.isdir(model_name):
+    # local model   
+    # local model shard
+    model_path = model_name.rstrip('/')
+    model_name = model_path.split('/')[-1]
+    if os.path.isfile(model_path+'/config.json'):
+      with open(model_path+'/config.json', 'r') as file:
+        config = json.load(file)
+        config_n_layers = config['num_hidden_layers']
+      shard = Shard(model_id=model_path, start_layer=0, end_layer=0, n_layers=config_n_layers)
+      tokenizer = await resolve_tokenizer(model_path)
+  else:
+    print(f"Error: Unsupported model '{model_name}' for inference engine {inference_engine.__class__.__name__}")
     return
-  tokenizer = await resolve_tokenizer(get_repo(shard.model_id, inference_class))
+  
   request_id = str(uuid.uuid4())
   callback_id = f"cli-wait-response-{request_id}"
   callback = node.on_token.register(callback_id)
